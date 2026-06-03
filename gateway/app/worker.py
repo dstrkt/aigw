@@ -101,3 +101,28 @@ def chunk_text(text: str, chunk_size: int = 512, overlap: int = 50) -> list:
             chunks.append(chunk)
         i += chunk_size - overlap
     return chunks
+@app.task
+def process_quota_event(event_type: str, key_id: str, used: int, limit: int):
+    asyncio.run(_process_quota_event(event_type, key_id, used, limit))
+
+async def _process_quota_event(event_type: str, key_id: str, used: int, limit: int):
+    from app.models import QuotaEvent
+    import uuid
+    from datetime import datetime, timezone
+
+    engine_local = create_async_engine(DATABASE_URL)
+    AsyncSession2 = sessionmaker(engine_local, class_=AsyncSession, expire_on_commit=False)
+
+    async with AsyncSession2() as session:
+        event = QuotaEvent(
+            id=uuid.uuid4(),
+            api_key_id=key_id,
+            event_type=event_type,
+            tokens_consumed=used,
+            tokens_limit=limit,
+            notified_at=datetime.now(timezone.utc)
+        )
+        session.add(event)
+        await session.commit()
+
+    print(f"Quota event: {event_type} key={key_id} {used}/{limit} ({round(used/limit*100)}%)")

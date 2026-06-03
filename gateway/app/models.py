@@ -107,3 +107,14 @@ class Message(Base):
     output_tokens   = Column(Integer)
     confidence_score = Column(Float)
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+class QuotaEvent(Base):
+    __tablename__ = "quota_events"
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id           = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True)
+    api_key_id       = Column(UUID(as_uuid=True), ForeignKey("api_keys.id"), nullable=True)
+    event_type       = Column(Enum("warning","critical","exceeded","reset", name="quota_event_type"))
+    tokens_consumed  = Column(BigInteger)
+    tokens_limit     = Column(BigInteger)
+    notified_at      = Column(TIMESTAMP(timezone=True))
+    created_at       = Column(TIMESTAMP(timezone=True), server_default=func.now())
+

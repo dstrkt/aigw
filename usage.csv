@@ -1,0 +1,1 @@
+id,request_id,model_requested,model_used,provider,input_tokens,output_tokens,total_tokens,latency_ms,status,created_at

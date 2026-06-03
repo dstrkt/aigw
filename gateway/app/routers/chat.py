@@ -96,23 +96,56 @@ async def chat_completions(request: Request, authorization: str = Header(...)):
     body  = await request.json()
     model = body.get("model", "groq/llama-3.1-8b-instant")
 
-    try:
-        response = await litellm.acompletion(
-            model=model,
-            messages=body["messages"],
-            stream=False,
-            timeout=30,
-            fallbacks=[]
-        )
-    except litellm.exceptions.AuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid API key for model provider")
-    except litellm.exceptions.RateLimitError:
-        raise HTTPException(status_code=429, detail="Model provider rate limit reached")
-    except litellm.exceptions.ServiceUnavailableError:
-        raise HTTPException(status_code=503, detail="Model provider unavailable")
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    # Fallback chain por proveedor
+    fallback_models = [
+        model,
+        "groq/llama-3.1-8b-instant",
+        "groq/llama3-8b-8192",
+    ]
+    # Quitar duplicados manteniendo orden
+    seen = set()
+    fallback_models = [m for m in fallback_models if not (m in seen or seen.add(m))]
 
+    response      = None
+    last_error    = None
+    model_used    = model
+
+    for attempt_model in fallback_models:
+        # Circuit breaker — verificar si el proveedor está bloqueado
+        provider      = attempt_model.split("/")[0]
+        cb_key        = f"circuit:{provider}"
+        r_cb          = aioredis.from_url(REDIS_URL)
+        cb_open       = await r_cb.get(cb_key)
+        await r_cb.close()
+
+        if cb_open:
+            continue  # Proveedor bloqueado, saltar al siguiente
+
+        try:
+            response   = await litellm.acompletion(
+                model=attempt_model,
+                messages=body["messages"],
+                stream=False,
+                timeout=30,
+            )
+            model_used = attempt_model
+            break
+        except Exception as e:
+            last_error = e
+            error_str  = str(e).lower()
+
+            # Abrir circuit breaker por 60s si hay error de servicio
+            if any(x in error_str for x in ["503", "502", "unavailable", "overloaded"]):
+                r_cb = aioredis.from_url(REDIS_URL)
+                await r_cb.setex(f"circuit:{provider}", 60, "1")
+                await r_cb.close()
+            continue
+
+    if response is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"All model providers failed. Last error: {str(last_error)}"
+        )
     total_tokens = 0
     if hasattr(response, "usage") and response.usage:
         total_tokens = response.usage.total_tokens or 0
