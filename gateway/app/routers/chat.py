@@ -1,45 +1,101 @@
 from fastapi import APIRouter, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
-import litellm, redis.asyncio as aioredis, os, time
+import litellm, redis.asyncio as aioredis, os, time, hashlib
 from datetime import datetime
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select, update
+from app.models import ApiKey
 
 router = APIRouter()
-r = aioredis.from_url(os.getenv("REDIS_URL", "redis://redis:6379"))
 
-# Configurar Groq
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL    = os.getenv("REDIS_URL", "redis://redis:6379")
+
+engine            = create_async_engine(DATABASE_URL)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
+
+async def validate_api_key(raw_key: str):
+    key_hash  = hashlib.sha256(raw_key.encode()).hexdigest()
+    cache_key = f"auth:key:{key_hash}"
+
+    r = aioredis.from_url(REDIS_URL)
+    cached = await r.get(cache_key)
+    await r.close()
+
+    if cached:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ApiKey).where(ApiKey.id == cached.decode())
+            )
+            return result.scalar_one_or_none()
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ApiKey).where(
+                ApiKey.key_hash == key_hash,
+                ApiKey.is_active == True
+            )
+        )
+        api_key = result.scalar_one_or_none()
+
+        if not api_key:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API Key")
+
+        await session.execute(
+            update(ApiKey)
+            .where(ApiKey.id == api_key.id)
+            .values(last_used_at=datetime.utcnow())
+        )
+        await session.commit()
+
+    r = aioredis.from_url(REDIS_URL)
+    await r.setex(cache_key, 300, str(api_key.id))
+    if api_key.quota_tokens_monthly:
+        await r.set(f"quota:limit:{str(api_key.id)}", api_key.quota_tokens_monthly)
+    await r.close()
+
+    return api_key
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request, authorization: str = Header(...)):
-    api_key = authorization.replace("Bearer ", "")
+    raw_key = authorization.replace("Bearer ", "").strip()
+    api_key = await validate_api_key(raw_key)
+    key_id  = str(api_key.id)
 
-    # --- Rate limit ---
-    minute = int(time.time() // 60)
-    rate_key = f"rate:{api_key}:{minute}"
-    count = await r.incr(rate_key)
+    r = aioredis.from_url(REDIS_URL)
+
+    # Rate limit
+    minute   = int(time.time() // 60)
+    rate_key = f"rate:{key_id}:{minute}"
+    count    = await r.incr(rate_key)
     await r.expire(rate_key, 60)
-    if count > 60:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    if count > (api_key.rate_limit_rpm or 60):
+        await r.close()
+        raise HTTPException(status_code=429, detail="Rate limit exceeded", headers={"Retry-After": "60"})
 
-    # --- Quota check ---
+    # Quota check
     month = datetime.now().strftime("%Y-%m")
-    used  = int(await r.get(f"quota:used:{api_key}:{month}") or 0)
-    limit = int(await r.get(f"quota:limit:{api_key}") or 500_000)
-    if used >= limit:
-        raise HTTPException(
-            status_code=429,
-            detail="Quota exceeded",
-            headers={
-                "X-Quota-Used":      str(used),
-                "X-Quota-Limit":     str(limit),
-                "X-Quota-Remaining": "0"
-            }
-        )
+    used  = int(await r.get(f"quota:used:{key_id}:{month}") or 0)
+    limit = int(await r.get(f"quota:limit:{key_id}") or 500_000)
 
-    body = await request.json()
+    if used >= limit:
+        await r.close()
+        raise HTTPException(status_code=429, detail="Quota exceeded",
+            headers={"X-Quota-Used": str(used), "X-Quota-Limit": str(limit), "X-Quota-Remaining": "0"})
+
+    if used >= limit * 0.95:
+        await r.publish("quota:events", f"critical:{key_id}:{used}:{limit}")
+    elif used >= limit * 0.80:
+        await r.publish("quota:events", f"warning:{key_id}:{used}:{limit}")
+
+    await r.close()
+
+    body  = await request.json()
     model = body.get("model", "groq/llama-3.1-8b-instant")
 
-    # --- Llamada al modelo ---
     try:
         response = await litellm.acompletion(
             model=model,
@@ -57,12 +113,13 @@ async def chat_completions(request: Request, authorization: str = Header(...)):
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    # --- Registrar tokens en Redis ---
     total_tokens = 0
     if hasattr(response, "usage") and response.usage:
         total_tokens = response.usage.total_tokens or 0
 
-    await r.incrby(f"quota:used:{api_key}:{month}", total_tokens)
+    r = aioredis.from_url(REDIS_URL)
+    await r.incrby(f"quota:used:{key_id}:{month}", total_tokens)
+    await r.close()
 
     remaining = max(0, limit - used - total_tokens)
 
