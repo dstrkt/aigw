@@ -5,7 +5,8 @@ from sqlalchemy import select, update
 from app.models import ApiKey
 from pydantic import BaseModel
 from typing import Optional
-from passlib.hash import bcrypt
+import hashlib
+#from passlib.hash import bcrypt
 import uuid, os, secrets, redis.asyncio as aioredis
 
 router = APIRouter()
@@ -25,13 +26,16 @@ class ApiKeyCreate(BaseModel):
 @router.post("/api-keys")
 async def create_api_key(data: ApiKeyCreate):
     raw_key = f"sk-gw-{secrets.token_hex(24)}"
-    prefix  = raw_key[:12]
-    hashed  = bcrypt.hash(raw_key)
+    prefix  = raw_key[:10]
+    #prefix  = raw_key[:12]
+    hashed  = hashlib.sha256(raw_key.encode()).hexdigest()
+    #hashed  = bcrypt.hash(raw_key)
 
     async with AsyncSessionLocal() as session:
         api_key = ApiKey(
             id=uuid.uuid4(),
-            project_id=data.project_id,
+            project_id=data.project_id if data.project_id else None,
+            #project_id=data.project_id,
             key_hash=hashed,
             key_prefix=prefix,
             label=data.label,
