@@ -1,0 +1,12 @@
+node_modules/
+.next/
+postgres-data/
+qdrant-storage/
+redis-data/
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.log
+.DS_Store
