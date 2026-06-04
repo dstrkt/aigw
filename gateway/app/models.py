@@ -15,8 +15,9 @@ class Organization(Base):
     billing_email        = Column(String(255))
     quota_tokens_monthly = Column(BigInteger)
     stripe_customer_id   = Column(String(100))
+    clerk_user_id        = Column(String(100), nullable=True, index=True)
     created_at           = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    is_active            = Column(Boolean, default=True)
+    is_active            = Column(Boolean, default=True, nullable=False, server_default="true")
 
 class Project(Base):
     __tablename__ = "projects"
@@ -35,7 +36,7 @@ class ApiKey(Base):
     label                = Column(String(100))
     quota_tokens_monthly = Column(BigInteger)
     rate_limit_rpm       = Column(Integer, default=60)
-    is_active            = Column(Boolean, default=True)
+    is_active            = Column(Boolean, default=True, nullable=False, server_default="true")
     last_used_at         = Column(TIMESTAMP(timezone=True))
     expires_at           = Column(TIMESTAMP(timezone=True))
     created_at           = Column(TIMESTAMP(timezone=True), server_default=func.now())
@@ -81,40 +82,40 @@ class Assistant(Base):
     confidence_threshold = Column(Float, default=0.65)
     escalation_email     = Column(String(255))
     widget_config        = Column(JSONB)
-    is_active            = Column(Boolean, default=True)
+    is_active            = Column(Boolean, default=True, nullable=False, server_default="true")
     created_at           = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 class Conversation(Base):
     __tablename__ = "conversations"
-    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    assistant_id    = Column(UUID(as_uuid=True), ForeignKey("assistants.id"))
-    session_id      = Column(String(100))
-    channel         = Column(Enum("web","whatsapp","slack","email","api", name="channel_type"))
-    user_identifier = Column(String(255))
-    escalated       = Column(Boolean, default=False)
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    assistant_id      = Column(UUID(as_uuid=True), ForeignKey("assistants.id"))
+    session_id        = Column(String(100))
+    channel           = Column(Enum("web","whatsapp","slack","email","api", name="channel_type"))
+    user_identifier   = Column(String(255))
+    escalated         = Column(Boolean, default=False)
     escalation_reason = Column(Text)
-    ticket_id       = Column(String(100))
-    started_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    ended_at        = Column(TIMESTAMP(timezone=True))
+    ticket_id         = Column(String(100))
+    started_at        = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    ended_at          = Column(TIMESTAMP(timezone=True))
 
 class Message(Base):
     __tablename__ = "messages"
-    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"))
-    role            = Column(Enum("user","assistant","system", name="message_role"))
-    content         = Column(Text)
-    input_tokens    = Column(Integer)
-    output_tokens   = Column(Integer)
-    confidence_score = Column(Float)
-    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
-class QuotaEvent(Base):
-    __tablename__ = "quota_events"
     id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    org_id           = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True)
-    api_key_id       = Column(UUID(as_uuid=True), ForeignKey("api_keys.id"), nullable=True)
-    event_type       = Column(Enum("warning","critical","exceeded","reset", name="quota_event_type"))
-    tokens_consumed  = Column(BigInteger)
-    tokens_limit     = Column(BigInteger)
-    notified_at      = Column(TIMESTAMP(timezone=True))
+    conversation_id  = Column(UUID(as_uuid=True), ForeignKey("conversations.id"))
+    role             = Column(Enum("user","assistant","system", name="message_role"))
+    content          = Column(Text)
+    input_tokens     = Column(Integer)
+    output_tokens    = Column(Integer)
+    confidence_score = Column(Float)
     created_at       = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
+class QuotaEvent(Base):
+    __tablename__ = "quota_events"
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id          = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True)
+    api_key_id      = Column(UUID(as_uuid=True), ForeignKey("api_keys.id"), nullable=True)
+    event_type      = Column(Enum("warning","critical","exceeded","reset", name="quota_event_type"))
+    tokens_consumed = Column(BigInteger)
+    tokens_limit    = Column(BigInteger)
+    notified_at     = Column(TIMESTAMP(timezone=True))
+    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())

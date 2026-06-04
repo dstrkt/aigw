@@ -1,106 +1,272 @@
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select
-from app.models import Assistant, Message
-import uuid, os, litellm
+from app.models import Assistant, KnowledgeBase, Conversation, Message
+from pydantic import BaseModel
+from typing import Optional
+import uuid, os
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+from fastembed import TextEmbedding
 
 router = APIRouter()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 QDRANT_URL   = os.getenv("QDRANT_URL", "http://qdrant:6333")
-os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
 
-engine = create_async_engine(DATABASE_URL)
+engine            = create_async_engine(DATABASE_URL)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
+embedding_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+qdrant          = QdrantClient(url=QDRANT_URL)
+
+class AssistantCreate(BaseModel):
+    name:                 str
+    kb_id:                str
+    project_id:           Optional[str] = None
+    model:                Optional[str] = "groq/llama-3.1-8b-instant"
+    system_prompt:        Optional[str] = "Eres un asistente de soporte util."
+    confidence_threshold: Optional[float] = 0.65
+    escalation_email:     Optional[str] = None
+
+class ChatRequest(BaseModel):
+    message:    str
+    session_id: Optional[str] = "default"
+
 @router.post("/assistants")
-async def create_assistant(data: dict):
+async def create_assistant(data: AssistantCreate):
     async with AsyncSessionLocal() as session:
         assistant = Assistant(
             id=uuid.uuid4(),
-            project_id=data.get("project_id"),
-            kb_id=data.get("kb_id"),
-            name=data.get("name", "Asistente"),
-            system_prompt=data.get("system_prompt", "Eres un asistente util. Responde basandote en el contexto proporcionado."),
-            model=data.get("model", "groq/llama-3.1-8b-instant"),
-            confidence_threshold=data.get("confidence_threshold", 0.65),
+            project_id=data.project_id or None,
+            kb_id=data.kb_id,
+            name=data.name,
+            model=data.model,
+            system_prompt=data.system_prompt,
+            confidence_threshold=data.confidence_threshold,
+            escalation_email=data.escalation_email,
+            is_active=True
         )
         session.add(assistant)
         await session.commit()
         await session.refresh(assistant)
-        return {"id": str(assistant.id), "name": assistant.name}
+        return {
+            "id":                   str(assistant.id),
+            "name":                 assistant.name,
+            "kb_id":                str(assistant.kb_id),
+            "project_id":           str(assistant.project_id) if assistant.project_id else None,
+            "model":                assistant.model,
+            "confidence_threshold": assistant.confidence_threshold,
+            "is_active":            assistant.is_active,
+            "created_at":           str(assistant.created_at)
+        }
 
-@router.post("/assistants/{assistant_id}/chat")
-async def chat(assistant_id: str, data: dict):
-    question   = data.get("message", "")
-    session_id = data.get("session_id", str(uuid.uuid4()))
+@router.get("/assistants")
+async def list_assistants(project_id: Optional[str] = None):
+    async with AsyncSessionLocal() as session:
+        query = select(Assistant).order_by(Assistant.created_at.desc())
+        if project_id:
+            query = query.where(Assistant.project_id == project_id)
+        result     = await session.execute(query)
+        assistants = result.scalars().all()
+        return [
+            {
+                "id":                   str(a.id),
+                "name":                 a.name,
+                "kb_id":                str(a.kb_id) if a.kb_id else None,
+                "project_id":           str(a.project_id) if a.project_id else None,
+                "model":                a.model,
+                "confidence_threshold": a.confidence_threshold,
+                "is_active":            a.is_active,
+                "created_at":           str(a.created_at)
+            }
+            for a in assistants
+        ]
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Assistant).where(Assistant.id == assistant_id))
+@router.get("/assistants/{assistant_id}")
+async def get_assistant(assistant_id: str):
+    async with AsyncSessionLocal() as session:
+        result    = await session.execute(select(Assistant).where(Assistant.id == assistant_id))
         assistant = result.scalar_one_or_none()
         if not assistant:
-            raise HTTPException(404, "Assistant not found")
+            raise HTTPException(404, "Asistente no encontrado")
+        return {
+            "id":                   str(assistant.id),
+            "name":                 assistant.name,
+            "kb_id":                str(assistant.kb_id) if assistant.kb_id else None,
+            "project_id":           str(assistant.project_id) if assistant.project_id else None,
+            "model":                assistant.model,
+            "system_prompt":        assistant.system_prompt,
+            "confidence_threshold": assistant.confidence_threshold,
+            "escalation_email":     assistant.escalation_email,
+            "is_active":            assistant.is_active,
+            "created_at":           str(assistant.created_at)
+        }
 
-        from qdrant_client import QdrantClient
-        from fastembed import TextEmbedding
+@router.post("/assistants/{assistant_id}/chat")
+async def chat_with_assistant(assistant_id: str, req: ChatRequest):
+    import litellm
 
-        embed_model  = TextEmbedding("BAAI/bge-small-en-v1.5")
-        query_vector = list(embed_model.embed([question]))[0].tolist()
+    async with AsyncSessionLocal() as session:
+        result    = await session.execute(select(Assistant).where(Assistant.id == assistant_id))
+        assistant = result.scalar_one_or_none()
+        if not assistant:
+            raise HTTPException(404, "Asistente no encontrado")
 
-        client     = QdrantClient(url=QDRANT_URL)
-        collection = f"kb_{str(assistant.kb_id)}"
+        # Cargar historial
+        conv_result = await session.execute(
+            select(Conversation).where(
+                Conversation.assistant_id == assistant.id,
+                Conversation.session_id   == req.session_id
+            )
+        )
+        conversation = conv_result.scalar_one_or_none()
+
+        if not conversation:
+            conversation = Conversation(
+                id=uuid.uuid4(),
+                assistant_id=assistant.id,
+                session_id=req.session_id,
+                channel="web"
+            )
+            session.add(conversation)
+            await session.commit()
+            await session.refresh(conversation)
+
+        # Cargar mensajes anteriores
+        msgs_result = await session.execute(
+            select(Message).where(Message.conversation_id == conversation.id)
+            .order_by(Message.created_at.desc()).limit(10)
+        )
+        prev_messages = list(reversed(msgs_result.scalars().all()))
+
+        # Generar embedding de la pregunta
+        embeddings   = list(embedding_model.embed([req.message]))
+        query_vector = embeddings[0].tolist()
+
+        # Buscar en Qdrant
+        collection_name = f"kb_{str(assistant.kb_id).replace('-', '_')}"
+        context_text    = ""
+        confidence      = 0.0
 
         try:
-            result_q  = client.query_points(
-                collection_name=collection,
-                query=query_vector,
+            search_results = qdrant.search(
+                collection_name=collection_name,
+                query_vector=query_vector,
                 limit=5,
-                score_threshold=0.3
+                score_threshold=0.5
             )
-            hits      = result_q.points
-            context   = "\n\n".join([h.payload["text"] for h in hits])
-            avg_score = sum(h.score for h in hits) / len(hits) if hits else 0
+            if search_results:
+                context_text = "\n\n".join([r.payload.get("text", "") for r in search_results])
+                confidence   = float(search_results[0].score)
+        except Exception:
+            pass
+
+        # Construir mensajes
+        history = [
+            {"role": m.role, "content": m.content}
+            for m in prev_messages
+        ]
+
+        system = assistant.system_prompt or "Eres un asistente de soporte util."
+        if context_text:
+            system += f"\n\nCONTEXTO RELEVANTE:\n{context_text[:2000]}"
+
+        messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": req.message}]
+
+        # Llamar al modelo
+        try:
+            response = await litellm.acompletion(
+                model=assistant.model or "groq/llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500,
+                stream=False
+            )
+            answer = response.choices[0].message.content
         except Exception as e:
-            print(f"Qdrant error: {e}")
-            context   = ""
-            avg_score = 0
+            answer = f"Lo siento, ocurrio un error al procesar tu consulta: {str(e)}"
 
-        if not context:
-            return JSONResponse(content={
-                "answer": "No encontre informacion sobre eso. Quieres que te conecte con un agente?",
-                "confidence": 0,
-                "escalate": True
-            })
-
-        prompt = f"Contexto:\n{context}\n\nPregunta: {question}\n\nResponde basandote unicamente en el contexto."
-
-        response = await litellm.acompletion(
-            model=assistant.model,
-            messages=[
-                {"role": "system", "content": assistant.system_prompt},
-                {"role": "user",   "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=500
-        )
-
-        answer   = response.choices[0].message.content
-        escalate = avg_score < float(assistant.confidence_threshold)
-
-        msg = Message(
+        # Guardar mensajes
+        user_msg = Message(
             id=uuid.uuid4(),
+            conversation_id=conversation.id,
+            role="user",
+            content=req.message
+        )
+        assistant_msg = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation.id,
             role="assistant",
             content=answer,
-            confidence_score=avg_score,
+            confidence_score=confidence
         )
-        db.add(msg)
-        await db.commit()
+        session.add(user_msg)
+        session.add(assistant_msg)
+        await session.commit()
 
-        return JSONResponse(content={
-            "answer": answer,
-            "confidence": round(avg_score, 3),
-            "escalate": escalate,
-            "chunks_used": len(hits)
-        })
+        # Evaluar si escalar
+        should_escalate = confidence < (assistant.confidence_threshold or 0.65) and confidence > 0
+
+        return {
+            "answer":           answer,
+            "confidence":       confidence,
+            "should_escalate":  should_escalate,
+            "conversation_id":  str(conversation.id),
+            "session_id":       req.session_id
+        }
+
+@router.post("/conversations/{conversation_id}/escalate")
+async def escalate_conversation(conversation_id: str):
+    async with AsyncSessionLocal() as session:
+        from sqlalchemy import update
+        await session.execute(
+            update(Conversation)
+            .where(Conversation.id == conversation_id)
+            .values(escalated=True)
+        )
+        await session.commit()
+        return {"escalated": True, "conversation_id": conversation_id}
+
+from pydantic import BaseModel as PydanticBase
+
+class AssistantUpdate(PydanticBase):
+    name:                 str | None = None
+    model:                str | None = None
+    system_prompt:        str | None = None
+    confidence_threshold: float | None = None
+    escalation_email:     str | None = None
+
+@router.patch("/assistants/{assistant_id}")
+async def update_assistant(assistant_id: str, data: AssistantUpdate):
+    from sqlalchemy import update as sql_update
+    values = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not values:
+        raise HTTPException(400, "No hay campos para actualizar")
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            sql_update(Assistant).where(Assistant.id == assistant_id).values(**values)
+        )
+        await session.commit()
+    return {"updated": True, "id": assistant_id}
+
+class AssistantUpdate(BaseModel):
+    name:                 str | None = None
+    model:                str | None = None
+    system_prompt:        str | None = None
+    confidence_threshold: float | None = None
+    escalation_email:     str | None = None
+
+@router.patch("/assistants/{assistant_id}")
+async def update_assistant(assistant_id: str, data: AssistantUpdate):
+    from sqlalchemy import update as sql_update
+    values = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not values:
+        raise HTTPException(400, "No hay campos para actualizar")
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            sql_update(Assistant).where(Assistant.id == assistant_id).values(**values)
+        )
+        await session.commit()
+    return {"updated": True, "id": assistant_id}
