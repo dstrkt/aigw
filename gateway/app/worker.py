@@ -68,7 +68,7 @@ async def _ingest(kb_id: str, file_path: str, filename: str):
             update(KnowledgeBase)
             .where(KnowledgeBase.id == kb_id)
             .values(
-                total_chunks=len(chunks),
+                total_chunks=KnowledgeBase.total_chunks + len(chunks),
                 last_indexed_at=datetime.now(timezone.utc)
             )
         )

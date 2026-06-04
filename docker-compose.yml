@@ -30,6 +30,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     volumes:
+      - /tmp/aigw-uploads:/tmp/aigw-uploads
       - uploads:/tmp/uploads
   portal:
     build: ./portal
@@ -64,6 +65,7 @@ services:
  #     - postgres
     restart: unless-stopped
     volumes:
+      - /tmp/aigw-uploads:/tmp/aigw-uploads
       - uploads:/tmp/uploads
 
   postgres:

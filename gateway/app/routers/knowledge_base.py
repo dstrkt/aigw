@@ -81,7 +81,9 @@ async def upload_document(kb_id: str, file: UploadFile = File(...)):
     import aiofiles, tempfile
 
     suffix = os.path.splitext(file.filename or "file")[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+    upload_dir = "/tmp/aigw-uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=upload_dir) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
