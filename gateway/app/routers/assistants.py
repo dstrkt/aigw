@@ -270,3 +270,188 @@ async def update_assistant(assistant_id: str, data: AssistantUpdate):
         )
         await session.commit()
     return {"updated": True, "id": assistant_id}
+
+@router.get("/assistants/{assistant_id}/widget.js")
+async def get_widget_js(assistant_id: str):
+    from fastapi.responses import Response
+    js = f"""
+(function() {{
+  var ASSISTANT_ID = '{assistant_id}';
+  var GATEWAY_URL  = window.location.protocol + '//' + window.location.hostname + (window.location.port ? ':' + window.location.port : '');
+
+  // Estilos
+  var style = document.createElement('style');
+  style.textContent = `
+    #aigw-btn {{
+      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+      width: 56px; height: 56px; border-radius: 50%;
+      background: #2563eb; color: white; border: none;
+      font-size: 24px; cursor: pointer;
+      box-shadow: 0 4px 12px rgba(37,99,235,0.4);
+      transition: transform 0.2s;
+    }}
+    #aigw-btn:hover {{ transform: scale(1.1); }}
+    #aigw-container {{
+      position: fixed; bottom: 92px; right: 24px; z-index: 9998;
+      width: 380px; height: 520px; border-radius: 16px;
+      background: #0f172a; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      display: none; flex-direction: column; overflow: hidden;
+      font-family: system-ui, sans-serif;
+      border: 1px solid #334155;
+    }}
+    #aigw-header {{
+      padding: 1rem 1.25rem; background: #1e293b;
+      display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid #334155;
+    }}
+    #aigw-title {{ color: #f1f5f9; font-size: 0.95rem; font-weight: 600; }}
+    #aigw-close {{
+      background: none; border: none; color: #64748b;
+      cursor: pointer; font-size: 1.2rem; padding: 0;
+    }}
+    #aigw-messages {{
+      flex: 1; overflow-y: auto; padding: 1rem;
+      display: flex; flex-direction: column; gap: 0.75rem;
+    }}
+    .aigw-msg {{
+      max-width: 85%; padding: 0.65rem 0.9rem;
+      border-radius: 12px; font-size: 0.85rem; line-height: 1.5;
+    }}
+    .aigw-msg.user {{
+      background: #2563eb; color: white;
+      align-self: flex-end; border-bottom-right-radius: 4px;
+    }}
+    .aigw-msg.assistant {{
+      background: #1e293b; color: #e2e8f0;
+      align-self: flex-start; border-bottom-left-radius: 4px;
+      border: 1px solid #334155;
+    }}
+    .aigw-msg.system {{
+      background: transparent; color: #64748b;
+      align-self: center; font-size: 0.75rem; text-align: center;
+    }}
+    #aigw-input-area {{
+      padding: 0.75rem; background: #1e293b;
+      border-top: 1px solid #334155;
+      display: flex; gap: 0.5rem;
+    }}
+    #aigw-input {{
+      flex: 1; padding: 0.6rem 0.9rem; border-radius: 8px;
+      border: 1px solid #334155; background: #0f172a;
+      color: #f1f5f9; font-size: 0.85rem; outline: none;
+    }}
+    #aigw-send {{
+      padding: 0.6rem 1rem; background: #2563eb; color: white;
+      border: none; border-radius: 8px; cursor: pointer;
+      font-size: 0.85rem; font-weight: 600;
+    }}
+    #aigw-send:disabled {{ background: #334155; cursor: not-allowed; }}
+    .aigw-escalate {{
+      background: #059669; color: white; border: none;
+      padding: 0.5rem 1rem; border-radius: 8px;
+      cursor: pointer; font-size: 0.8rem; margin-top: 0.5rem;
+    }}
+  `;
+  document.head.appendChild(style);
+
+  // HTML
+  var sessionId = 'sess_' + Math.random().toString(36).slice(2);
+  var container = document.createElement('div');
+  container.id  = 'aigw-container';
+  container.innerHTML = `
+    <div id="aigw-header">
+      <span id="aigw-title">Asistente de Soporte</span>
+      <button id="aigw-close">✕</button>
+    </div>
+    <div id="aigw-messages">
+      <div class="aigw-msg system">Hola! Como puedo ayudarte hoy?</div>
+    </div>
+    <div id="aigw-input-area">
+      <input id="aigw-input" type="text" placeholder="Escribe tu pregunta..." />
+      <button id="aigw-send">Enviar</button>
+    </div>
+  `;
+
+  var btn = document.createElement('button');
+  btn.id          = 'aigw-btn';
+  btn.textContent = '💬';
+
+  document.body.appendChild(container);
+  document.body.appendChild(btn);
+
+  var open = false;
+  btn.addEventListener('click', function() {{
+    open = !open;
+    container.style.display = open ? 'flex' : 'none';
+    btn.textContent = open ? '✕' : '💬';
+    if (open) document.getElementById('aigw-input').focus();
+  }});
+
+  document.getElementById('aigw-close').addEventListener('click', function() {{
+    open = false;
+    container.style.display = 'none';
+    btn.textContent = '💬';
+  }});
+
+  function addMessage(role, text) {{
+    var msgs = document.getElementById('aigw-messages');
+    var div  = document.createElement('div');
+    div.className = 'aigw-msg ' + role;
+    div.textContent = text;
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+    return div;
+  }}
+
+  function addEscalateButton(conversationId) {{
+    var msgs = document.getElementById('aigw-messages');
+    var btn  = document.createElement('button');
+    btn.className   = 'aigw-escalate';
+    btn.textContent = '👤 Hablar con un agente humano';
+    btn.onclick = function() {{
+      fetch(GATEWAY_URL + '/v1/conversations/' + conversationId + '/escalate', {{method: 'POST'}});
+      btn.textContent = '✓ Agente notificado - en breve te contactaran';
+      btn.disabled = true;
+    }};
+    msgs.appendChild(btn);
+    msgs.scrollTop = msgs.scrollHeight;
+  }}
+
+  async function sendMessage() {{
+    var input = document.getElementById('aigw-input');
+    var send  = document.getElementById('aigw-send');
+    var text  = input.value.trim();
+    if (!text) return;
+
+    input.value = '';
+    send.disabled = true;
+    addMessage('user', text);
+
+    var thinking = addMessage('assistant', '...');
+
+    try {{
+      var res = await fetch(GATEWAY_URL + '/v1/assistants/' + ASSISTANT_ID + '/chat', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ message: text, session_id: sessionId }})
+      }});
+      var data = await res.json();
+      thinking.textContent = data.answer || 'Lo siento, ocurrio un error.';
+      if (data.should_escalate) {{
+        addEscalateButton(data.conversation_id);
+      }}
+    }} catch(e) {{
+      thinking.textContent = 'Error de conexion. Intenta de nuevo.';
+    }}
+
+    send.disabled = false;
+    input.focus();
+  }}
+
+  document.getElementById('aigw-send').addEventListener('click', sendMessage);
+  document.getElementById('aigw-input').addEventListener('keypress', function(e) {{
+    if (e.key === 'Enter') sendMessage();
+  }});
+}})();
+""".strip()
+    return Response(content=js, media_type="application/javascript")
